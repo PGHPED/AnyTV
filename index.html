@@ -175,6 +175,12 @@
     let reintentosRed = 0;
     const MAX_REINTENTOS = 3;
 
+    // Cada vez que se elige un canal, este número sube uno.
+    // Sirve para que, si cambias de canal muy rápido, las respuestas
+    // "tardías" del canal anterior no toquen nada (evita choques raros
+    // que pueden colgar el navegador).
+    let sesionActual = 0;
+
     // Cache de estado online/offline por URL, para no repetir
     // comprobaciones cuando el usuario solo está filtrando la lista.
     const estadoCache = new Map();
@@ -306,14 +312,17 @@
     }
 
     // ---------- Comprobación de estado online/offline ----------
-    // Hace peticiones reales a cada canal, con un límite de 6 en
-    // paralelo (para no saturar la conexión) y un timeout de 5s cada una.
+    // Hace peticiones reales a cada canal, con un límite de 3 en
+    // paralelo (menos que antes, para no saturar el navegador si
+    // encima estás reproduciendo algo) y un timeout de 5s cada una.
     async function verificarEstados(filas){
       const cola = filas.slice();
-      const trabajadores = Array.from({ length: 6 }, async () => {
+      const trabajadores = Array.from({ length: 3 }, async () => {
         while(cola.length){
           const fila = cola.shift();
           await verificarUno(fila);
+          // Pequeña pausa entre comprobaciones para no ir a saco
+          await new Promise(r => setTimeout(r, 120));
         }
       });
       await Promise.all(trabajadores);
@@ -325,15 +334,23 @@
       const timer = setTimeout(() => controlador.abort(), 5000);
 
       try{
-        await fetch(fila.canal.url, {
+        const res = await fetch(fila.canal.url, {
           method: "GET",
           mode: "cors",
           cache: "no-store",
           signal: controlador.signal,
         });
-        estadoCache.set(fila.canal.url, true);
-        if(badge){ badge.textContent = "● ONLINE"; badge.classList.add("online"); }
-        fila.li.classList.remove("offline");
+        // No basta con que responda: comprobamos que de verdad sea
+        // un manifest de vídeo válido, para evitar falsos "online".
+        const texto = await res.text();
+        const esValido = res.ok && texto.trim().startsWith("#EXTM3U");
+
+        estadoCache.set(fila.canal.url, esValido);
+        if(badge){
+          badge.textContent = esValido ? "● ONLINE" : "○ OFFLINE";
+          badge.classList.toggle("online", esValido);
+        }
+        fila.li.classList.toggle("offline", !esValido);
       }catch(err){
         estadoCache.set(fila.canal.url, false);
         if(badge){ badge.textContent = "○ OFFLINE"; badge.classList.remove("online"); }
@@ -345,6 +362,11 @@
 
     // ---------- Reproducir un canal ----------
     function reproducir(canal, elemento){
+      // Nueva sesión: todo lo que pertenezca a una sesión antigua
+      // se va a ignorar, aunque tarde en responder.
+      sesionActual++;
+      const miSesion = sesionActual;
+
       document.querySelectorAll("#canales li").forEach(li => li.classList.remove("activo"));
       elemento.classList.add("activo");
 
@@ -364,44 +386,59 @@
         // Safari reproduce HLS de forma nativa (no usa hls.js)
         $video.src = canal.url;
         $video.play().catch(()=>{});
-      }else if(window.Hls && Hls.isSupported()){
-        hls = new Hls({
-          enableWorker: true,          // el trabajo pesado va en un hilo aparte, más fluido
-          capLevelToPlayerSize: true,  // no descarga más calidad de la que se ve en pantalla
-          maxBufferLength: 30,
-          backBufferLength: 60,
-          liveSyncDurationCount: 3,
-        });
-        hls.loadSource(canal.url);
-        hls.attachMedia($video);
+        return;
+      }
 
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          $video.play().catch(()=>{});
-          construirSelectorCalidad();
-        });
-
-        hls.on(Hls.Events.ERROR, (evt, data) => {
-          if(!data.fatal) return;
-
-          if(reintentosRed < MAX_REINTENTOS){
-            reintentosRed++;
-            if(data.type === Hls.ErrorTypes.NETWORK_ERROR){
-              hls.startLoad();
-              return;
-            }
-            if(data.type === Hls.ErrorTypes.MEDIA_ERROR){
-              hls.recoverMediaError();
-              return;
-            }
-          }
-
-          $sinSenal.style.display = "flex";
-          $sinSenal.querySelector("p").textContent = "THIS CHANNEL IS DOWN — TRY ANOTHER";
-        });
-      }else{
+      if(!(window.Hls && Hls.isSupported())){
         $sinSenal.style.display = "flex";
         $sinSenal.querySelector("p").textContent = "YOUR BROWSER CAN'T PLAY THIS";
+        return;
       }
+
+      try{
+        hls = new Hls({
+          enableWorker: true,           // el trabajo pesado va en un hilo aparte, más fluido
+          capLevelToPlayerSize: true,   // no descarga más calidad de la que se ve en pantalla
+          maxBufferLength: 20,          // segundos de vídeo guardados por delante
+          maxMaxBufferLength: 30,
+          backBufferLength: 20,         // segundos guardados por detrás (ya reproducidos)
+          maxBufferSize: 30 * 1000 * 1000, // tope de ~30MB en memoria, para no dispararse
+          liveSyncDurationCount: 3,
+        });
+      }catch(err){
+        $sinSenal.style.display = "flex";
+        $sinSenal.querySelector("p").textContent = "PLAYER ERROR — TRY ANOTHER CHANNEL";
+        return;
+      }
+
+      hls.loadSource(canal.url);
+      hls.attachMedia($video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if(miSesion !== sesionActual) return; // ya se cambió de canal, ignorar
+        $video.play().catch(()=>{});
+        construirSelectorCalidad();
+      });
+
+      hls.on(Hls.Events.ERROR, (evt, data) => {
+        if(miSesion !== sesionActual) return; // respuesta tardía de un canal viejo
+        if(!data.fatal) return;
+
+        if(reintentosRed < MAX_REINTENTOS){
+          reintentosRed++;
+          if(data.type === Hls.ErrorTypes.NETWORK_ERROR){
+            hls.startLoad();
+            return;
+          }
+          if(data.type === Hls.ErrorTypes.MEDIA_ERROR){
+            hls.recoverMediaError();
+            return;
+          }
+        }
+
+        $sinSenal.style.display = "flex";
+        $sinSenal.querySelector("p").textContent = "THIS CHANNEL IS DOWN — TRY ANOTHER";
+      });
     }
 
     // ---------- Selector manual de calidad ----------
@@ -444,4 +481,3 @@
 
 </body>
 </html>
-
