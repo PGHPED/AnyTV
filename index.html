@@ -222,6 +222,7 @@
           return;
         }
 
+        canales = aplicarOverrideLa1(canales, code);
         canales = pinnearCanal(canales, /la\s*1\b/i);
         canalesActuales = canales;
         $estadoPais.textContent = "";
@@ -236,6 +237,24 @@
       if(idx > 0){
         const [fijado] = canales.splice(idx, 1);
         canales.unshift(fijado);
+      }
+      return canales;
+    }
+
+    // Para España, forzamos el link de La 1 a uno concreto que sabemos
+    // que es el que usa la propia RTVE (la lista automática a veces
+    // trae uno viejo o roto). Si no encuentra "La 1" en la lista,
+    // la añade ella misma.
+    function aplicarOverrideLa1(canales, code){
+      if(code !== "es") return canales;
+
+      const urlLa1 = "https://rtvelivestream.rtve.es/rtvesec/la1/la1_main_dvr.m3u8";
+      const idx = canales.findIndex(c => /la\s*1\b/i.test(c.nombre));
+
+      if(idx !== -1){
+        canales[idx].url = urlLa1;
+      }else{
+        canales.unshift({ nombre: "La 1", url: urlLa1 });
       }
       return canales;
     }
